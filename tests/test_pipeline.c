@@ -788,6 +788,8 @@ TEST(pipeline_edge_props_valid_json) {
 
 /* ── Calls pass tests ──────────────────────────────────────────── */
 
+static void write_temp_file(const char *dir, const char *name, const char *content);
+
 TEST(pipeline_calls_resolution) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -812,6 +814,129 @@ TEST(pipeline_calls_resolution) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_test_repo();
+    PASS();
+}
+
+/* C++ receiver calls must retain the enclosing Method as their persisted
+ * caller. Cover local dot dispatch, typed pointer-parameter dispatch, and a
+ * statically typed factory-return chain. Same-named methods on Decoy guard
+ * against a weak short-name fallback choosing the wrong class. */
+TEST(pipeline_cpp_receiver_calls_keep_method_caller) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "receivers.cpp",
+                    "class Worker {\n"
+                    "public:\n"
+                    "  void dot() {}\n"
+                    "  void pointer() {}\n"
+                    "};\n"
+                    "class Decoy {\n"
+                    "public:\n"
+                    "  void dot() {}\n"
+                    "  void pointer() {}\n"
+                    "  void work() {}\n"
+                    "};\n"
+                    "class Manager {\n"
+                    "public:\n"
+                    "  static Manager* getInstance() {\n"
+                    "    static Manager manager;\n"
+                    "    return &manager;\n"
+                    "  }\n"
+                    "  void work() {}\n"
+                    "};\n"
+                    "class Caller {\n"
+                    "public:\n"
+                    "  void run(Worker* pointer) {\n"
+                    "    Worker instance;\n"
+                    "    instance.dot();\n"
+                    "    pointer->pointer();\n"
+                    "    Manager::getInstance()->work();\n"
+                    "  }\n"
+                    "};\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cpp_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_node_t *runs = NULL;
+    int run_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "run", &runs, &run_count), CBM_STORE_OK);
+    ASSERT_EQ(run_count, 1);
+    ASSERT_STR_EQ(runs[0].label, "Method");
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(s, runs[0].id, "CALLS", &edges, &edge_count),
+              CBM_STORE_OK);
+    bool found_dot = false;
+    bool found_pointer = false;
+    bool found_work = false;
+    bool found_decoy = false;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t target = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK) {
+            if (target.qualified_name && strstr(target.qualified_name, ".Worker.dot")) {
+                found_dot = true;
+            } else if (target.qualified_name && strstr(target.qualified_name, ".Worker.pointer")) {
+                found_pointer = true;
+            } else if (target.qualified_name && strstr(target.qualified_name, ".Manager.work")) {
+                found_work = true;
+            } else if (target.qualified_name && strstr(target.qualified_name, ".Decoy.")) {
+                found_decoy = true;
+            }
+        }
+        cbm_node_free_fields(&target);
+    }
+    ASSERT_TRUE(found_dot);
+    ASSERT_TRUE(found_pointer);
+    ASSERT_TRUE(found_work);
+    ASSERT_FALSE(found_decoy);
+
+    /* Every inbound edge for these receiver callees must come from Caller.run,
+     * never from the fixture's File or Module node. */
+    cbm_edge_t *all_calls = NULL;
+    int all_call_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, project, "CALLS", &all_calls, &all_call_count),
+              CBM_STORE_OK);
+    int receiver_call_count = 0;
+    for (int i = 0; i < all_call_count; i++) {
+        cbm_node_t target = {0};
+        cbm_node_t source = {0};
+        if (cbm_store_find_node_by_id(s, all_calls[i].target_id, &target) == CBM_STORE_OK &&
+            target.qualified_name &&
+            (strstr(target.qualified_name, ".Worker.dot") ||
+             strstr(target.qualified_name, ".Worker.pointer") ||
+             strstr(target.qualified_name, ".Manager.work"))) {
+            receiver_call_count++;
+            ASSERT_EQ(cbm_store_find_node_by_id(s, all_calls[i].source_id, &source), CBM_STORE_OK);
+            ASSERT_EQ(source.id, runs[0].id);
+            ASSERT_STR_EQ(source.label, "Method");
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    ASSERT_EQ(receiver_call_count, 3);
+
+    if (all_calls) {
+        cbm_store_free_edges(all_calls, all_call_count);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_store_free_nodes(runs, run_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
     PASS();
 }
 
@@ -971,7 +1096,6 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
  * Type-resolved receivers (`c.test()` on a typed SalesforceRestClient) and bare
  * local calls must still resolve. < 50 files → sequential path (pass_calls.c).
  * RED before the fix: checkFormat->test exists via unique_name/suffix_match. */
-static void write_temp_file(const char *dir, const char *name, const char *content);
 TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_recv_XXXXXX");
@@ -7786,6 +7910,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
+    RUN_TEST(pipeline_cpp_receiver_calls_keep_method_caller);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
