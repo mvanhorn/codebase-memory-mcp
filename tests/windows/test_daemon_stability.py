@@ -21,6 +21,9 @@ that guard the daemon's PRODUCT contract under stress and misuse:
   responsive afterwards.
 * Concurrent cold start: parallel one-shots racing with no daemon must all
   succeed, and the ephemeral daemon they share must retire afterwards.
+* Idle MCP frontend: once startup is excluded, the real client-side process
+  tree (not the shared daemon) must consume less than one CPU-second over a
+  ten-second no-traffic window.
 
 Every daemon this guard starts carries a kill-by-pid backstop so a stuck
 daemon can never hang the suite. Each section runs under its OWN cache
@@ -44,6 +47,9 @@ import threading
 import time
 
 STATUS_POLL_S = 0.5
+IDLE_CPU_SETTLE_S = 5
+IDLE_CPU_WINDOW_S = 10
+IDLE_CPU_MAX_S = 1.0
 
 
 def run_cli(binary, cache, args, stdin=None, timeout=90):
@@ -61,7 +67,8 @@ def kill_pid(pid):
     if not pid:
         return
     if os.name == "nt":
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=30)
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True, timeout=30)
     else:
         subprocess.run(["kill", "-9", str(pid)], capture_output=True, timeout=30)
 
@@ -69,6 +76,61 @@ def kill_pid(pid):
 def pid_from(text):
     match = re.search(r"pid[: ]+(\d+)", text)
     return int(match.group(1)) if match else 0
+
+
+def windows_client_process_cpu(root_pid, daemon_pid):
+    """Return TotalProcessorTime for the client tree, excluding the daemon tree."""
+    script = r"""
+$rootProcessId = %d
+$daemonProcessId = %d
+$allProcesses = @(Get-CimInstance Win32_Process |
+    Select-Object ProcessId, ParentProcessId)
+
+function Get-ProcessTree([int]$rootProcessId, $allProcesses) {
+    $seen = @{}
+    $seen[$rootProcessId] = $true
+    do {
+        $changed = $false
+        foreach ($processInfo in $allProcesses) {
+            $processId = [int]$processInfo.ProcessId
+            $parentProcessId = [int]$processInfo.ParentProcessId
+            if ($seen.ContainsKey($parentProcessId) -and -not $seen.ContainsKey($processId)) {
+                $seen[$processId] = $true
+                $changed = $true
+            }
+        }
+    } while ($changed)
+    return @($seen.Keys | ForEach-Object { [int]$_ })
+}
+
+$clientIds = @(Get-ProcessTree $rootProcessId $allProcesses)
+$daemonIds = @(Get-ProcessTree $daemonProcessId $allProcesses)
+$rows = @()
+foreach ($processId in $clientIds) {
+    if ($daemonIds -contains $processId) {
+        continue
+    }
+    try {
+        $process = Get-Process -Id $processId -ErrorAction Stop
+        $rows += [pscustomobject]@{
+            pid = [int]$process.Id
+            name = $process.ProcessName
+            cpu_seconds = [double]$process.TotalProcessorTime.TotalSeconds
+        }
+    } catch {
+        # A process that exits between the topology and CPU snapshots is
+        # reported as absent; the Python guard rejects a changing idle tree.
+    }
+}
+[pscustomobject]@{ processes = @($rows) } | ConvertTo-Json -Compress -Depth 3
+""" % (root_pid, daemon_pid)
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError("PowerShell process snapshot failed: %s" % result.stderr[:300])
+    payload = json.loads(result.stdout)
+    return {int(row["pid"]): row for row in payload.get("processes", [])}
 
 
 def wait_status_not_running(binary, cache, deadline_s):
@@ -253,6 +315,97 @@ def section_stop_refuses_busy(binary, work):
         kill_pid(daemon_pid)
 
 
+def section_idle_frontend_cpu(binary, work):
+    if os.name != "nt":
+        print("PASS: idle frontend CPU guard is Windows-only")
+        return True
+
+    cache = os.path.join(work, "cache-idle-cpu")
+    os.makedirs(cache, exist_ok=True)
+    env = dict(os.environ)
+    env["CBM_CACHE_DIR"] = cache
+    session = None
+    daemon_pid = 0
+    try:
+        # No initialize frame is intentional: this reproduces an editor that
+        # holds both stdio pipes open while its daemon-backed frontend is idle.
+        session = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, env=env)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and session.poll() is None:
+            status = run_cli(binary, cache, ["daemon", "status"], timeout=30)
+            daemon_pid = pid_from(out_text(status))
+            if status.returncode == 0 and daemon_pid:
+                break
+            time.sleep(STATUS_POLL_S)
+        if session.poll() is not None or not daemon_pid:
+            print("SETUP FAIL: idle MCP frontend did not attach to a daemon")
+            return False
+
+        # The daemon's authenticated peer is the actual frontend process. Pin
+        # it before measuring so a launcher-only or daemon-only snapshot cannot
+        # make the CPU guard pass accidentally.
+        busy = run_cli(binary, cache, ["daemon", "stop"], timeout=30)
+        listed_pids = [int(value) for value in re.findall(r"- pid (\d+)", out_text(busy))]
+        if busy.returncode == 0 or not listed_pids:
+            print("SETUP FAIL: daemon did not identify the attached idle frontend:\n%s"
+                  % out_text(busy)[:400])
+            return False
+
+        time.sleep(IDLE_CPU_SETTLE_S)
+        before = windows_client_process_cpu(session.pid, daemon_pid)
+        frontend_pids = [pid for pid in listed_pids if pid in before]
+        if not frontend_pids:
+            print("SETUP FAIL: authenticated frontend pid(s) %s were not in client tree %s; "
+                  "refusing a launcher/daemon false green"
+                  % (listed_pids, sorted(before)))
+            return False
+
+        time.sleep(IDLE_CPU_WINDOW_S)
+        after = windows_client_process_cpu(session.pid, daemon_pid)
+        if set(before) != set(after):
+            print("RED: idle frontend process tree changed during measurement: before=%s after=%s"
+                  % (sorted(before), sorted(after)))
+            return False
+
+        cpu_delta = sum(max(0.0, after[pid]["cpu_seconds"] - row["cpu_seconds"])
+                        for pid, row in before.items())
+        if cpu_delta >= IDLE_CPU_MAX_S:
+            print("RED: idle frontend tree %s consumed %.3fs CPU over %.1fs (limit %.3fs); "
+                  "daemon pid %d was excluded"
+                  % (sorted(before), cpu_delta, IDLE_CPU_WINDOW_S,
+                     IDLE_CPU_MAX_S, daemon_pid))
+            return False
+        print("PASS: idle frontend tree %s consumed %.3fs CPU over %.1fs; daemon pid %d excluded"
+              % (sorted(before), cpu_delta, IDLE_CPU_WINDOW_S, daemon_pid))
+        return True
+    finally:
+        if session:
+            if session.stdin:
+                try:
+                    session.stdin.close()
+                except OSError:
+                    pass
+            try:
+                session.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                kill_pid(session.pid)
+                try:
+                    session.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    pass
+        if daemon_pid:
+            stopped = False
+            try:
+                stop = run_cli(binary, cache, ["daemon", "stop"], timeout=30)
+                stopped = (stop.returncode == 0 or "not running" in out_text(stop)) and \
+                          wait_status_not_running(binary, cache, 30)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            if not stopped:
+                kill_pid(daemon_pid)
+
+
 def section_crash_recovery(binary, work):
     cache = os.path.join(work, "cache-crash")
     os.makedirs(cache, exist_ok=True)
@@ -384,6 +537,7 @@ def main():
         section_hook_fail_open,
         section_start_status_port,
         section_stop_refuses_busy,
+        section_idle_frontend_cpu,
         section_crash_recovery,
         section_churn_stability,
         section_cold_storm,

@@ -39,7 +39,9 @@ enum {
      * receiving every response while a genuinely stuck request still gets
      * cancelled and the frontend exits cleanly. */
     FRONTEND_EOF_DRAIN_MS = 15000,
-    FRONTEND_MAINTENANCE_POLL_MS = 10,
+    /* Maintenance activation remains sub-second while an idle frontend avoids
+     * continuously probing the secure cohort lock on Windows. */
+    FRONTEND_MAINTENANCE_POLL_MS = 250,
     /* The owner thread may be draining a supervised process tree. Preserve the
      * supervisor's complete graceful + forced-settle window before the monitor
      * fail-stops the process, plus scheduling/teardown margin. */
@@ -62,7 +64,6 @@ typedef struct {
 typedef struct {
     cbm_mutex_t mutex;
     cbm_daemon_runtime_client_t *client;
-    cbm_version_cohort_manager_t *cohort_manager;
     FILE *out;
     frontend_item_t queue[FRONTEND_QUEUE_CAPACITY];
     size_t head;
@@ -108,14 +109,20 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
         }
 
         if (presence == CBM_VERSION_COHORT_MAINTENANCE_REQUESTED) {
-            if (monitor->cancel) {
-                (void)monitor->cancel(monitor->cancel_context);
-            }
+            bool cancellation_started = monitor->cancel && monitor->cancel(monitor->cancel_context);
             /* Never log, write to, or flush agent stdio from this monitor.
              * Structured logging itself writes to stderr, and this thread's
              * reason for existing is to remain runnable when another frontend
              * thread is blocked on a full stdout/stderr pipe. The activation
              * owner records the maintenance event durably. */
+
+            /* Only an operation whose cooperative cancellation was accepted
+             * needs the supervisor grace window. An idle frontend has no
+             * active request to unwind and can release its cohort reservation
+             * immediately, keeping maintenance inside its reservation bound. */
+            if (!cancellation_started) {
+                _Exit(monitor->exit_code);
+            }
 
             uint64_t now = cbm_now_ms();
             uint64_t deadline = now > UINT64_MAX - FRONTEND_MAINTENANCE_GRACE_MS
@@ -175,19 +182,6 @@ bool cbm_daemon_maintenance_monitor_stop(cbm_daemon_maintenance_monitor_t **moni
     free(monitor);
     *monitor_io = NULL;
     return true;
-}
-
-static void frontend_exit_for_maintenance(frontend_state_t *state) {
-    cbm_version_cohort_maintenance_presence_t presence =
-        cbm_version_cohort_maintenance_presence_terminal(state->cohort_manager);
-    if (presence == CBM_VERSION_COHORT_MAINTENANCE_ABSENT) {
-        return;
-    }
-    /* Do not fclose stdin across threads. Process exit closes the authenticated
-     * kernel IPC handle, and daemon ownership then cancels only this session.
-     * Agent stdout/stderr may both be backpressured, so terminal paths must not
-     * log, write, or flush before fail-stop. */
-    _Exit(presence == CBM_VERSION_COHORT_MAINTENANCE_REQUESTED ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
 static void frontend_item_free(frontend_item_t *item) {
@@ -414,15 +408,7 @@ static frontend_cancellation_route_t frontend_route_cancellation(
 
 static void *frontend_worker(void *opaque) {
     frontend_state_t *state = opaque;
-    uint64_t next_maintenance_check_ms = 0;
     for (;;) {
-        uint64_t now_ms = cbm_now_ms();
-        if (now_ms >= next_maintenance_check_ms) {
-            frontend_exit_for_maintenance(state);
-            next_maintenance_check_ms = now_ms > UINT64_MAX - FRONTEND_MAINTENANCE_POLL_MS
-                                            ? UINT64_MAX
-                                            : now_ms + FRONTEND_MAINTENANCE_POLL_MS;
-        }
         frontend_item_t item = {0};
         if (!frontend_pop_begin(state, &item)) {
             if (frontend_should_stop(state)) {
@@ -578,7 +564,6 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
     }
     frontend_state_t state = {
         .client = client,
-        .cohort_manager = cohort_manager,
         .out = out,
     };
     cbm_mutex_init(&state.mutex);
